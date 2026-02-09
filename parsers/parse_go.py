@@ -103,7 +103,37 @@ class GoTreeSitterParser(TreeSitterBase):
 def parse_go(content, file_path):
     if TS_GO:
         try:
-            return GoTreeSitterParser(content, file_path).parse()
+            chunks = GoTreeSitterParser(content, file_path).parse()
+
+            # If no chunks were extracted but file has content, create a module-level chunk
+            if not chunks and content.strip():
+                from chunk import Chunk
+                import re
+
+                # Extract imports
+                imports = re.findall(r'import\s+"([^"]+)"', content)
+                imports.extend(re.findall(r'import\s+\(\s*([^)]+)\)', content, re.DOTALL))
+
+                # Extract function calls
+                calls = re.findall(r'(\w+)\s*\(', content)
+                calls = [c for c in calls if c not in BUILTIN_GO and c not in SKIP_GO]
+
+                chunk_id = f"{file_path}::module::main"
+                chunks = [Chunk(
+                    id=chunk_id,
+                    name=file_path.split('/')[-1],
+                    type='module',
+                    file=file_path,
+                    start=1,
+                    end=len(content.split('\n')),
+                    language='go',
+                    code=content,
+                    docstring=f"Go module: {file_path}",
+                    calls=list(set(calls)),
+                    imports=list(set(imports)),
+                )]
+
+            return chunks
         except Exception as e:
             print(f"  Tree-sitter error: {e}")
     return []

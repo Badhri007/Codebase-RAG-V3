@@ -156,7 +156,41 @@ class JSTreeSitterParser(TreeSitterBase):
 def parse_javascript(content, file_path, language='javascript'):
     if TS_JS:
         try:
-            return JSTreeSitterParser(content, file_path, language).parse()
+            chunks = JSTreeSitterParser(content, file_path, language).parse()
+
+            if not chunks and content.strip():
+                from chunk import Chunk
+                import re
+
+                imports = []
+                imports.extend(re.findall(r'require\(["\']([^"\']+)["\']\)', content))
+                imports.extend(re.findall(r'from\s+["\']([^"\']+)["\']', content))
+                imports.extend(re.findall(r'import\s+["\']([^"\']+)["\']', content))
+
+
+                calls = []
+                call_matches = re.findall(r'(\w+)\.(\w+)\s*\(', content)
+                calls.extend([method for obj, method in call_matches if method not in BUILTIN_JS])
+
+                standalone_calls = re.findall(r'^\s*(\w+)\s*\(', content, re.MULTILINE)
+                calls.extend([c for c in standalone_calls if c not in BUILTIN_JS and c not in {'const', 'let', 'var', 'if', 'for', 'while'}])
+
+                chunk_id = f"{file_path}::module::main"
+                chunks = [Chunk(
+                    id=chunk_id,
+                    name=file_path.split('/')[-1],
+                    type='module',
+                    file=file_path,
+                    start=1,
+                    end=len(content.split('\n')),
+                    language=language,
+                    code=content,
+                    docstring=f"Entry point/configuration module: {file_path}",
+                    calls=list(set(calls)),
+                    imports=list(set(imports)),
+                )]
+
+            return chunks
         except Exception as e:
             print(f"  Tree-sitter error: {e}")
     return []

@@ -12,6 +12,10 @@ AI-powered code understanding with AST parsing and dependency graph traversal.
 
 ## Quick Start
 
+Run this while starting neo4j
+
+sudo chown -R $USER:$(id -g) .
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # Add your API keys

@@ -5,7 +5,7 @@ from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
 from config import REPOS_DIR, MAX_CONTEXT_TOKENS, DIAGRAM_KEYWORDS
-from core import GitManager, read_file, get_language
+from core import GitManager, read_file, get_language, is_test_file
 from chunk import Chunk
 from parsers import parse_file
 from graph import Neo4jDependencyGraph
@@ -16,6 +16,8 @@ from hierarchical_chunking import (
     HierarchicalChunker,
     ChunkingStrategy
 )
+from repo_analyzer import RepositoryAnalyzer, RepoContext
+from query_analyzer import QueryAnalyzer, QueryType
 
 load_dotenv()
 
@@ -64,6 +66,11 @@ class RAGPipeline:
         self.chunking_strategy = chunking_strategy
         self.chunker = HierarchicalChunker(chunking_strategy)
 
+        # Repository and Query Analyzers
+        self.repo_analyzer = RepositoryAnalyzer()
+        self.query_analyzer = QueryAnalyzer(self.llm, use_llm=True)
+        self.repo_context: Optional[RepoContext] = None
+
         # State
         self.current_repo: Optional[str] = None
         self.history: List[Dict] = []
@@ -73,15 +80,10 @@ class RAGPipeline:
         print(f"  Graph: {'Neo4j' if self.use_neo4j else 'In-memory'}")
         print(f"  Contextual: {use_contextual_retrieval}")
         print(f"  LLM Context: {use_llm_context}")
+        print(f"  Query Analyzer: Enabled")
+        print(f"  Repo Analyzer: Enabled")
 
     def index(self, repo_url: str, force: bool = False):
-        """
-        Index repository with all enhancements.
-
-        Args:
-            repo_url: GitHub repository URL
-            force: Force re-index even if exists
-        """
         repo_name = self.git.extract_repo_name(repo_url)
         print(f"\n{'='*60}")
         print(f"Indexing: {repo_name}")
@@ -133,6 +135,10 @@ class RAGPipeline:
               # Parse with AST
               chunks = parse_file(content, file_path, language)
 
+              # Mark test chunks
+              is_test = is_test_file(file_path)
+              for chunk in chunks:
+                  chunk.is_test = is_test
 
               if len(content) > 1000:
                   stats['files_enhanced'] += 1
@@ -181,11 +187,23 @@ class RAGPipeline:
 
         print("Chunks : ", all_chunks[:4])
 
+        print("\n📊 Analyzing repository structure...")
+
+        self.repo_context = self.repo_analyzer.analyze(all_chunks, repo_name, all_scanned_files=files)
+
+        # Create overview chunk
+        overview_chunk = self.repo_analyzer.create_overview_chunk(self.repo_context)
+        all_chunks.append(overview_chunk)
+
+        print(f"  ✓ Repository analysis complete")
+        print(f"    - Architecture: {self.repo_context.architecture_pattern}")
+        print(f"    - Entry points: {len(self.repo_context.entry_points)}")
+        print(f"    - Components: {len(self.repo_context.components)}")
+
         # Build graph
-        print("\n Building dependency graph...")
+        print("\n🔗 Building dependency graph...")
         if self.graph:
             self.graph.build(all_chunks, repo_name)
-
 
         # Index embeddings
         print("\n Indexing embeddings...")
@@ -197,6 +215,7 @@ class RAGPipeline:
         self.bm25.save(repo_name)
 
         self.current_repo = repo_name
+        self.export_repo_context(f"docs/{repo_name}_structure.json")
 
         print(f"\n✅ Indexing complete!")
         print(f"  Chunks: {len(all_chunks)}")
@@ -211,7 +230,6 @@ class RAGPipeline:
         Args:
             question: User question
             n_chunks: Number of chunks to retrieve
-            traversal_strategy: 'smart', 'deep', 'wide', 'dependency'
             explain: Show retrieval process
 
         Returns:
@@ -220,17 +238,49 @@ class RAGPipeline:
         if not self.current_repo:
             raise ValueError("No repository loaded. Call index() first.")
 
+        query_analysis = self.query_analyzer.analyze(question)
+
+        if explain:
+            print(f"\n🔍 Query Analysis:")
+            print(f"  Type: {query_analysis.query_type.value}")
+            print(f"  Confidence: {query_analysis.confidence:.2f}")
+            print(f"  Needs repo context: {query_analysis.needs_repo_context}")
+            print(f"  Include tests: {query_analysis.include_tests}")
+
+        # Get optimal retrieval config
+        retrieval_config = self.query_analyzer.get_retrieval_config(query_analysis)
+        n_chunks = retrieval_config['k']
+
         if explain:
             print(f"\n🔍 Retrieval Process:")
             print(f"  Target: {n_chunks} chunks")
 
-        # 1. Hybrid search
+        # 1. Multi-query hybrid search with rewritten queries
         if explain:
-            print(f"\n1️⃣ Hybrid Search...")
+            print(f"\n1️⃣ Multi-Query Hybrid Search...")
+            print(f"  Using {len(query_analysis.rewritten_queries)} query variations")
 
-        search_results = self.hybrid_search(
-            self.current_repo, question, k=n_chunks
-        )
+        all_search_results = []
+        for rewritten_query in query_analysis.rewritten_queries[:3]:
+            results = self.hybrid_search(
+                self.current_repo,
+                rewritten_query,
+                k=n_chunks // 2,
+                include_tests=retrieval_config['include_tests']
+            )
+            all_search_results.extend(results)
+
+        # Deduplicate and merge scores
+        seen_ids = {}
+        for result in all_search_results:
+            chunk_id = result['id']
+            if chunk_id in seen_ids:
+                # Average the scores for duplicate chunks
+                seen_ids[chunk_id]['score'] = (seen_ids[chunk_id]['score'] + result['score']) / 2
+            else:
+                seen_ids[chunk_id] = result
+
+        search_results = sorted(seen_ids.values(), key=lambda x: x['score'], reverse=True)[:n_chunks]
 
         if not search_results:
             return {
@@ -278,11 +328,18 @@ class RAGPipeline:
         if explain:
             print(f"  Final: {len(chunks)} chunks")
 
-        # 3. Build context
+        # 3. Build context with repo overview if needed
         if explain:
             print(f"\n3️⃣ Building Context...")
 
         context = self._build_context_smart(chunks)
+
+        # Add repository overview for architectural queries
+        if query_analysis.needs_repo_context:
+            repo_overview = self._get_repo_overview()
+            if repo_overview and explain:
+                print(f"  Adding repository overview context")
+            context = f"{repo_overview}\n\n{'='*60}\n\n{context}"
 
         if explain:
             print(f"  Size: ~{len(context) // 4} tokens")
@@ -312,8 +369,8 @@ class RAGPipeline:
         return self._parse_response(answer)
 
     def hybrid_search(self, repo_name: str, query: str,
-                     k: int = 25, alpha: float = 0.6) -> List[Dict]:
-        """Hybrid search with contextual boost."""
+                      k: int = 25, alpha: float = 0.6, include_tests: bool = False) -> List[Dict]:
+        """Hybrid search with contextual boost and test filtering."""
 
         # Vector search
         vector_results = self.db.search(repo_name, query, n=k*2)
@@ -353,6 +410,10 @@ class RAGPipeline:
                 # Boost summaries
                 if 'summary' in chunk.type:
                     score *= 1.1
+
+                # Filter/penalize test chunks
+                if not include_tests and chunk.is_test:
+                    score *= 0.2
 
             combined[chunk_id] = score
 
@@ -483,7 +544,25 @@ class RAGPipeline:
         print(f"✓ Loaded: {repo_name}")
         return True
 
+    def _get_repo_overview(self) -> str:
+        """Get repository overview text."""
+        if self.repo_context and self.graph:
+            # Look for overview chunk
+            for chunk_id, chunk in self.graph.chunks.items():
+                if chunk.type == 'repo_overview':
+                    return chunk.code
+        return ""
+
+    def export_repo_context(self, filepath: str = None) -> str:
+        if not self.repo_context:
+            raise ValueError("No repository context available. Index a repository first.")
+
+        if filepath:
+            self.repo_context.save_to_file(filepath)
+            return f"Saved to {filepath}"
+        else:
+            return self.repo_context.to_json()
+
     def close(self):
-        """Close connections."""
         if self.graph:
             self.graph.close()

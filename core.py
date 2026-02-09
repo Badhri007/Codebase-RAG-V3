@@ -6,6 +6,25 @@ from git import Repo, GitCommandError
 from config import IGNORE_PATTERNS, MAX_FILE_SIZE, LANG_MAP
 
 
+# Test file detection patterns
+TEST_PATTERNS = [
+    r'test_.*\.py$',
+    r'test_.*\.go$',
+    r'_test\.go$',
+    r'.*_test\.py$',
+    r'.*\.test\.(js|ts|jsx|tsx)$',
+    r'.*\.spec\.(js|ts|jsx|tsx)$',
+    r'/tests?/',
+    r'/__tests__/',
+    r'/test/',
+]
+
+
+def is_test_file(file_path: str) -> bool:
+    """Check if file is a test file."""
+    return any(re.search(pattern, file_path.lower()) for pattern in TEST_PATTERNS)
+
+
 class GitManager:
     """Git operations for cloning and managing repositories."""
 

@@ -126,4 +126,38 @@ def parse_python(content: str, file_path: str) -> List[Chunk]:
                 visit(child, None)
 
     visit(tree)
+
+    # If no chunks were extracted but file has content, create a module-level chunk
+    if not chunks and content.strip():
+        import re
+
+        # Extract imports
+        module_imports = []
+        module_imports.extend(re.findall(r'import\s+(\w+)', content))
+        module_imports.extend(re.findall(r'from\s+(\S+)\s+import', content))
+
+        # Extract function calls
+        module_calls = []
+        call_matches = re.findall(r'(\w+)\s*\(', content)
+        module_calls = [c for c in call_matches if c not in {
+            'print', 'len', 'str', 'int', 'float', 'list', 'dict',
+            'set', 'tuple', 'range', 'enumerate', 'zip', 'isinstance',
+            'type', 'super', 'if', 'for', 'while', 'with'
+        }]
+
+        chunk_id = make_id(f"{file_path}::module::main")
+        chunks = [Chunk(
+            id=chunk_id,
+            name=file_path.split('/')[-1],
+            type='module',
+            file=file_path,
+            start=1,
+            end=len(lines),
+            language='python',
+            code=content,
+            docstring=f"Module-level code: {file_path}",
+            calls=list(set(module_calls)),
+            imports=list(set(module_imports)),
+        )]
+
     return chunks

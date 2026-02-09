@@ -48,6 +48,9 @@ class Chunk:
     contextual_embedding_text: Optional[str] = None      # Context + code
     use_contextual_embedding: bool = True                # Use context?
 
+    # Test file detection
+    is_test: bool = False                                 # Is this a test chunk?
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
