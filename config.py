@@ -4,9 +4,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-PERSIST_DIR = os.getenv("PERSIST_DIR", str(BASE_DIR / "chroma_db"))
 REPOS_DIR = os.getenv("REPOS_DIR", str(BASE_DIR / "repos"))
-GRAPH_DIR = os.getenv("GRAPH_DIR", str(BASE_DIR / "graph_db"))
 BM25_DIR = str(BASE_DIR/"bm25_db")
 
 load_dotenv()
@@ -16,12 +14,21 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 
-for d in [PERSIST_DIR, REPOS_DIR, GRAPH_DIR]:
+for d in [REPOS_DIR]:
     Path(d).mkdir(parents=True, exist_ok=True)
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 MAX_CONTEXT_TOKENS = 12000
 CHUNK_SIZE = 1500
+
+
+# Agent Configuration
+AGENT_TEMPERATURE = 0.1
+SYNTHESIS_TEMPERATURE = 0.3
+
+# Indexing Configuration
+BATCH_SIZE = 10  # For semantic enrichment
+MAX_FILES_PER_REPO = 10000
 
 DIAGRAM_KEYWORDS = [
     r'\bflow\b', r'\bdiagram\b', r'\bvisuali[sz]e\b', r'\barchitecture\b',

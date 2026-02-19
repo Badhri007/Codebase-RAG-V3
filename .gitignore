@@ -2,7 +2,8 @@ __pycache__
 .venv
 repos/
 .env
-chroma_db/
+chroma_data/
 neo4j
 bm25_db/
 mds/
+archived/

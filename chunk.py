@@ -36,6 +36,11 @@ class Chunk:
     imports: List[str] = field(default_factory=list)    # Imports used
     parent: Optional[str] = None                         # Parent class/struct
 
+    # Enhanced resolution data (NEW)
+    imports_map: Dict[str, Dict[str, str]] = field(default_factory=dict)  # {name: {from: path, name: actual}}
+    type_map: Dict[str, str] = field(default_factory=dict)  # {var_name: type_name}
+    calls_with_context: List[Dict[str, str]] = field(default_factory=list)  # [{name, receiver, receiver_type}]
+
     # Context (for better retrieval)
     docstring: Optional[str] = None                      # Documentation
     signature: Optional[str] = None                      # Function signature

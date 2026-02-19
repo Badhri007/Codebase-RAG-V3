@@ -1,282 +1,353 @@
-"""Enhanced Streamlit UI for Codebase RAG with all features."""
+"""Streamlit UI for Codebase RAG with dynamic LLM & Embedding provider selection."""
+
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from indexer import index_repository
+from query import answer_query
+import re
 
 load_dotenv()
 
-st.set_page_config(page_title="Enhanced Codebase RAG", page_icon="🔍", layout="wide")
+st.set_page_config(
+    page_title="Codebase RAG",
+    page_icon="🔍",
+    layout="wide"
+)
 
-st.markdown("""
-<style>
-    h1 { text-align: center; color: #4F46E5; }
-    .stChatMessage { border-radius: 10px; }
-    .metric-card {
-        background: #f8fafc;
-        padding: 12px;
-        border-radius: 8px;
-        border-left: 4px solid #4F46E5;
-    }
-</style>
-""", unsafe_allow_html=True)
+# -------------------- PROVIDER OPTIONS -------------------- #
 
+LLM_OPTIONS = {
+    "Claude Sonnet 4":  ("claude",    "claude-sonnet-4-20250514"),
+    "Claude Haiku 3.5": ("claude",    "claude-haiku-3-5-20241022"),
+    "GPT-4o":           ("openai",    "gpt-4o"),
+    "GPT-4o Mini":      ("openai",    "gpt-4o-mini"),
+    "Gemini Flash":     ("gemini",    "gemini-2.0-flash-exp"),
+    "DeepSeek V3":      ("deepseek",  "deepseek-chat"),
+}
+
+HF_MODELS = [
+    "all-MiniLM-L6-v2",
+    "all-mpnet-base-v2",
+    "BAAI/bge-small-en-v1.5",
+    "BAAI/bge-large-en-v1.5",
+    "nomic-ai/nomic-embed-text-v1",
+]
+
+# -------------------- SESSION DEFAULTS -------------------- #
+
+defaults = {
+    "messages":         [],
+    "current_repo":     None,
+    "indexing":         False,
+    "llm":              "Claude Sonnet 4",
+    "emb_provider":     "huggingface",   # "huggingface" | "jina"
+    "emb_model":        "all-MiniLM-L6-v2",
+    "jina_base_url":    "http://localhost:8080",
+    "jina_api_key":     "",
+}
+
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# -------------------- HELPERS -------------------- #
 
 def render_mermaid(code: str, height: int = 500):
-    """Render Mermaid diagram."""
     html = f"""
     <html><head>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-    </head><body style="background:#f8fafc;padding:20px;">
-    <pre class="mermaid">{code}</pre>
-    <script>mermaid.initialize({{startOnLoad:true,theme:'default'}});</script>
+        <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    </head>
+    <body style="background:#f8fafc;padding:20px;">
+        <pre class="mermaid">{code}</pre>
+        <script>mermaid.initialize({{startOnLoad:true,theme:'default'}});</script>
     </body></html>
     """
     components.html(html, height=height, scrolling=True)
 
 
-LLM_OPTIONS = {
-    "Claude Sonnet 4": ("claude", "claude-sonnet-4-20250514"),
-    "GPT-4o": ("openai", "gpt-4o"),
-    "GPT-4o Mini": ("openai", "gpt-4o-mini"),
-    "Gemini Flash": ("gemini", "gemini-2.0-flash-exp"),
-    "DeepSeek V3": ("deepseek", "deepseek-chat"),
-}
-
-TRAVERSAL_STRATEGIES = {
-    "Smart (Balanced)": "smart",
-    "Deep (Follow dependencies)": "deep",
-    "Wide (Explore breadth)": "wide",
-    "Dependency First": "dependency"
-}
-
-# Session state initialization
-defaults = {
-    'rag': None,
-    'messages': [],
-    'llm': "Claude Sonnet 4",
-    'traversal_strategy': "smart",
-    'initialized': False
-}
-
-for key, default in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+def display_message(content: str):
+    parts = re.split(r'```mermaid\n(.*?)\n```', content, flags=re.DOTALL)
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            if part.strip():
+                st.markdown(part)
+        else:
+            with st.expander("📊 View Diagram", expanded=True):
+                render_mermaid(part, height=600)
 
 
-def init_rag(provider, model, use_neo4j=True, use_contextual=True, use_llm_context=False):
-    """Initialize RAG pipeline with configuration."""
-    try:
-        from rag import RAGPipeline
-        from hierarchical_chunking import ChunkingStrategy
-
-        # Create chunking strategy
-        chunking_strategy = ChunkingStrategy(
-            use_contextual_retrieval=use_contextual,
-            use_llm_for_context=use_llm_context,
-            llm_provider=provider,
-            max_chunk_size=2000,
-            create_file_summary=True,
-            create_class_summary=True,
-        )
-
-        st.session_state.rag = RAGPipeline(
-            llm_provider=provider,
-            llm_model=model,
-            use_neo4j=use_neo4j,
-            use_contextual_retrieval=use_contextual,
-            use_llm_context=use_llm_context,
-            chunking_strategy=chunking_strategy
-        )
-
-        st.session_state.init_config = {
-            'use_neo4j': use_neo4j,
-            'use_contextual': use_contextual,
-            'use_llm_context': use_llm_context
+def get_embedding_kwargs() -> dict:
+    """Return kwargs to pass to VectorDB / index_repository."""
+    if st.session_state.emb_provider == "jina":
+        return {
+            "embedding_provider": "jina",
+            "model":              st.session_state.emb_model,
+            "base_url":          st.session_state.jina_base_url,
+            **({"api_key": st.session_state.jina_api_key} if st.session_state.jina_api_key else {}),
         }
-        st.session_state.initialized = True
-        return True
-    except Exception as e:
-        st.error(f"Initialization error: {e}")
-        return False
+    return {
+        "embedding_provider": "huggingface",
+        "model":              st.session_state.emb_model,
+    }
 
+# -------------------- STYLES -------------------- #
 
-# Sidebar
+st.markdown("""
+<style>
+    h1 { text-align: center; color: #4F46E5; }
+    .stChatMessage { border-radius: 10px; }
+    .provider-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 600;
+        background: #EEF2FF;
+        color: #4F46E5;
+        margin-left: 6px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------- SIDEBAR -------------------- #
+
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    if not st.session_state.initialized:
-        st.subheader("Initial Setup")
+    # -------- LLM Provider -------- #
+    st.subheader("🤖 LLM Provider")
+    llm_choice = st.selectbox(
+        "LLM Model",
+        list(LLM_OPTIONS.keys()),
+        index=list(LLM_OPTIONS.keys()).index(st.session_state.llm),
+        label_visibility="collapsed",
+        key="llm_select",
+    )
+    if llm_choice != st.session_state.llm:
+        st.session_state.llm = llm_choice
+        st.rerun()
 
+    provider, model_id = LLM_OPTIONS[st.session_state.llm]
+    st.caption(f"Provider: `{provider}` · Model: `{model_id}`")
 
-        use_neo4j = st.checkbox("Use Neo4j graph database", value=True)
-        use_contextual = st.checkbox("Use contextual retrieval", value=True)
-        use_llm_context = st.checkbox("Use LLM for context (expensive)", value=False)
+    st.divider()
 
-        if st.button("🚀 Initialize System", type="primary"):
-            provider, model = LLM_OPTIONS["Claude Sonnet 4"]
-            with st.spinner("Initializing enhanced RAG system..."):
-                if init_rag(provider, model, use_neo4j, use_contextual, use_llm_context):
-                    st.success("✅ System ready!")
-                    st.rerun()
+    # -------- Embedding Provider -------- #
+    st.subheader("🧬 Embedding Provider")
 
-    else:
-        # Show current config
-        with st.expander("📊 Current Configuration", expanded=False):
-            config = st.session_state.init_config or {}
-            st.caption(f"**Graph:** {'Neo4j' if config.get('use_neo4j') else 'In-memory'}")
-            st.caption(f"**Contextual:** {'✓' if config.get('use_contextual') else '✗'}")
-            st.caption(f"**LLM Context:** {'✓' if config.get('use_llm_context') else '✗'}")
+    if st.session_state.current_repo:
+        st.warning("Changing embeddings requires **re-indexing** (use Force).", icon="⚠️")
 
-        st.divider()
+    emb_provider = st.radio(
+        "Provider",
+        ["huggingface", "jina"],
+        index=["huggingface", "jina"].index(st.session_state.emb_provider),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if emb_provider != st.session_state.emb_provider:
+        st.session_state.emb_provider = emb_provider
+        st.rerun()
 
-        # LLM selection
-        st.subheader("🤖 LLM Provider")
-        llm_choice = st.selectbox(
-            "Select LLM",
-            list(LLM_OPTIONS.keys()),
-            index=list(LLM_OPTIONS.keys()).index(st.session_state.llm),
-            label_visibility="collapsed"
-        )
-        provider, model = LLM_OPTIONS[llm_choice]
+    if st.session_state.emb_provider == "huggingface":
+        emb_model = st.selectbox("HF Model", HF_MODELS,
+                                 index=HF_MODELS.index(st.session_state.emb_model)
+                                       if st.session_state.emb_model in HF_MODELS else 0)
+        if emb_model != st.session_state.emb_model:
+            st.session_state.emb_model = emb_model
+            st.rerun()
+        st.caption(f"`{emb_model}`")
 
-        # Switch LLM
-        if llm_choice != st.session_state.llm:
-            if st.button("🔄 Switch LLM"):
-                if st.session_state.rag:
-                    st.session_state.rag.switch_llm(provider, model)
-                    st.session_state.llm = llm_choice
-                    st.rerun()
+    else:  # jina
+        emb_model   = st.text_input("Model name",   value=st.session_state.emb_model,
+                                     placeholder="jina-embeddings-v3")
+        jina_url    = st.text_input("Base URL",      value=st.session_state.jina_base_url,
+                                     placeholder="http://localhost:8080")
+        jina_key    = st.text_input("API key (opt)", value=st.session_state.jina_api_key,
+                                     type="password", placeholder="leave blank if self-hosted")
+        if (emb_model   != st.session_state.emb_model or
+            jina_url    != st.session_state.jina_base_url or
+            jina_key    != st.session_state.jina_api_key):
+            st.session_state.emb_model     = emb_model
+            st.session_state.jina_base_url = jina_url
+            st.session_state.jina_api_key  = jina_key
+            st.rerun()
 
-        st.divider()
+    st.divider()
 
-        n_chunks = st.slider("Chunks to retrieve", 10, 40, 25, 5)
+    # -------- Indexed Repos -------- #
+    st.subheader("📚 Indexed Repositories")
+    try:
+        from vectordb import VectorDB
+        from graph import Graph
 
-        st.divider()
+        vector_db = VectorDB()
+        graph = Graph()
+        indexed_repos = vector_db.list_repos()
 
-        # Repositories
-        st.subheader("📚 Repositories")
-
-        if st.session_state.rag:
-            repos = st.session_state.rag.list_repos()
-
-            if repos:
-                for repo in repos:
-                    col1, col2 = st.columns([4, 1])
+        if indexed_repos:
+            for repo in indexed_repos:
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
                     with col1:
-                        current = st.session_state.rag.current_repo == repo
-                        label = f"{'✓ ' if current else ''}{repo[:30]}"
-                        if st.button(
-                            label,
-                            key=f"load_{repo}",
-                            disabled=current,
-                            use_container_width=True
-                        ):
-                            st.session_state.rag.load(repo)
+                        label = repo.split("__")[1] if "__" in repo else repo
+                        if st.button(f"📦 {label}", key=f"select_{repo}", use_container_width=True):
+                            st.session_state.current_repo = repo
                             st.session_state.messages = []
                             st.rerun()
                     with col2:
-                        if st.button("🗑️", key=f"del_{repo}"):
-                            st.session_state.rag.delete_repo(repo)
+                        if st.button("🗑️", key=f"delete_{repo}"):
+                            vector_db.delete_repo(repo)
+                            graph.clear_repo(repo)
+                            if st.session_state.current_repo == repo:
+                                st.session_state.current_repo = None
+                                st.session_state.messages = []
+                            st.success(f"Deleted {repo}")
                             st.rerun()
-            else:
-                st.info("No repositories indexed yet")
 
-        # Advanced
-        with st.expander("⚙️ Advanced"):
-            diagram_height = st.slider("Diagram height", 300, 800, 500)
-            show_retrieval = st.checkbox("Show retrieval details", value=False)
+                    if st.session_state.current_repo == repo:
+                        st.markdown("**✓ Active**")
+        else:
+            st.info("No repositories indexed yet")
 
+        graph.close()
 
-# Main content
+    except Exception as e:
+        st.error(f"Error loading repos: {e}")
+
+    if st.session_state.current_repo:
+        st.success(f"📦 Active: {st.session_state.current_repo}")
+
+# -------------------- MAIN -------------------- #
+
 st.title("🔍 Codebase RAG")
+st.caption("Direct, accurate code understanding with Neo4j graph")
 
-if not st.session_state.initialized:
-    st.info("👈 Configure and initialize the system in the sidebar to get started")
-    st.stop()
-
-# Index section
-st.subheader("Index Repository")
-col1, col2, col3 = st.columns([5, 1, 1])
-with col1:
-    url = st.text_input(
-        "GitHub Repository URL",
-        placeholder="https://github.com/owner/repo",
-        label_visibility="collapsed"
-    )
-with col2:
-    index_btn = st.button("Index", type="primary")
-with col3:
-    force = st.checkbox("Force", help="Force re-index even if exists")
-
-if index_btn and url and st.session_state.rag:
-    with st.spinner("Indexing repository... (this may take several minutes)"):
-        try:
-            st.session_state.rag.index(url, force)
-            st.session_state.messages = []
-            st.success("✅ Repository indexed successfully!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"❌ Indexing failed: {str(e)}")
+# Active provider summary
+llm_prov, llm_mod = LLM_OPTIONS[st.session_state.llm]
+emb_mod = st.session_state.emb_model
+st.caption(
+    f"🤖 **LLM:** {st.session_state.llm} &nbsp;|&nbsp; "
+    f"🧬 **Embeddings:** `{emb_mod}`"
+)
 
 st.divider()
 
-# Chat interface
-if not st.session_state.rag.current_repo:
-    st.info("👆 Index or select a repository from the sidebar to start asking questions")
-else:
-    # Display chat history
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("diagram"):
-                with st.expander("📊 Architecture Diagram", expanded=True):
-                    render_mermaid(msg["diagram"], diagram_height)
+# -------------------- INDEX SECTION -------------------- #
 
-    # Chat input
-    if prompt := st.chat_input("Ask about the codebase..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+st.subheader("📦 Index Repository")
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
+col1, col2, col3 = st.columns([5, 1, 1])
 
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing codebase..."):
-                try:
-                    # Call enhanced ask with retrieval strategy
-                    result = st.session_state.rag.ask(
-                        prompt,
-                        n_chunks=n_chunks,
-                        explain=show_retrieval
-                    )
+with col1:
+    url = st.text_input(
+        "GitHub Repository URL or Local Path",
+        placeholder="https://github.com/owner/repo",
+        label_visibility="collapsed",
+        disabled=st.session_state.indexing,
+    )
 
-                    st.markdown(result['answer'])
+with col2:
+    index_btn = st.button("Index", type="primary", disabled=st.session_state.indexing)
 
-                    if result.get('diagram'):
-                        with st.expander("📊 Architecture Diagram", expanded=True):
-                            render_mermaid(result['diagram'], diagram_height)
+with col3:
+    force = st.checkbox("Force")
 
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": result['answer'],
-                        "diagram": result.get('diagram')
-                    })
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-                    import traceback
-                    with st.expander("Error details"):
-                        st.code(traceback.format_exc())
+if index_btn and url:
+    st.session_state.indexing = True
 
-    # Clear chat button
-    if st.session_state.messages:
-        col1, col2, col3 = st.columns([1, 1, 8])
-        with col1:
-            if st.button("🗑️ Clear Chat"):
-                st.session_state.messages = []
-                st.session_state.rag.clear_history()
-                st.rerun()
-        with col2:
-            if st.button("📊 Show Stats"):
-                stats = st.session_state.rag.get_stats()
-                with st.expander("Repository Statistics", expanded=True):
-                    for key, value in stats.items():
-                        st.caption(f"**{key}:** {value}")
+    try:
+        with st.status("🔄 Indexing repository...") as status:
+            if url.startswith("http"):
+                repo_name = (
+                    url.rstrip("/").split("/")[-2]
+                    + "__"
+                    + url.rstrip("/").split("/")[-1]
+                ).lower()
+            else:
+                import os
+                repo_name = os.path.basename(url.rstrip("/")).lower()
+
+            st.write("📥 Cloning/reading repository...")
+            st.write("📖 Parsing all files...")
+            st.write("🔗 Building graph with accurate resolution...")
+            st.write("💾 Storing in databases...")
+            st.write(f"🧬 Using embedding model: `{emb_mod}`")
+
+            emb_kwargs = get_embedding_kwargs()
+            index_repository(url, force, **emb_kwargs)
+
+            status.update(label="✅ Indexing complete!", state="complete")
+            st.session_state.current_repo = repo_name
+            st.session_state.messages = []
+
+        st.success(f"✅ {repo_name} indexed successfully!")
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"❌ Indexing failed: {e}")
+        import traceback
+        with st.expander("Error details"):
+            st.code(traceback.format_exc())
+
+    finally:
+        st.session_state.indexing = False
+
+st.divider()
+
+# -------------------- CHAT -------------------- #
+
+if not st.session_state.current_repo:
+    st.info("👆 Index a repository to start asking questions")
+    st.stop()
+
+st.subheader(f"💬 Ask Questions — {st.session_state.current_repo}")
+
+# -------- Display History -------- #
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        display_message(msg["content"])
+
+# -------- Chat Input -------- #
+
+if prompt := st.chat_input("Ask about the codebase..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        try:
+            with st.status("🤖 Processing...") as status:
+                st.write("🔍 Searching vector database...")
+                st.write("🔗 Expanding through graph...")
+                st.write(f"🤖 Generating answer with {st.session_state.llm}...")
+
+                answer = answer_query(
+                    prompt,
+                    st.session_state.current_repo,
+                    llm_provider=llm_prov,
+                    llm_model=llm_mod,
+                    **get_embedding_kwargs(),
+                )
+
+                status.update(label="✅ Answer ready!", state="complete")
+
+            display_message(answer)
+
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+            import traceback
+            with st.expander("Error details"):
+                st.code(traceback.format_exc())
+
+# -------- Clear Chat -------- #
+
+if st.session_state.messages:
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
