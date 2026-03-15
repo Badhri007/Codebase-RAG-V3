@@ -1,343 +1,416 @@
-"""Simplified graph with 100% accurate call resolution using Neo4j."""
-from typing import List, Dict, Optional, Set
+"""
+graph.py
+
+Change from original:
+  store_chunks() passes receiver_type and resolved flag from
+  calls_with_context to go_package_map.resolve_call().
+  Calls with resolved=False and no receiver_type are still attempted
+  (same-package direct calls are valid unresolved cases) but calls
+  with a receiver and resolved=False are skipped to avoid wrong edges.
+"""
+
 from collections import deque
+from typing import List, Dict, Optional
 from chunk import Chunk
 from neo4j import GraphDatabase
+from parsers.go_resolver import GoPackageMap
 import os
+
+BATCH = 500
+
+EXTENSION_CANDIDATES = {
+    "python":     [".py", "/__init__.py"],
+    "javascript": [".js", ".jsx", "/index.js"],
+    "typescript": [".ts", ".tsx", "/index.ts", ".js", "/index.js"],
+    "java":       [".java"],
+    "go":         [".go"],
+}
+
+EXTERNAL_JAVA = (
+    "java.", "javax.", "android.", "kotlin.", "scala.",
+    "org.junit", "org.springframework", "org.hibernate",
+    "com.google", "com.fasterxml", "com.amazonaws",
+    "org.slf4j", "ch.qos", "io.netty",
+)
 
 
 class Graph:
-    """Neo4j graph with accurate import-based resolution."""
 
     def __init__(self, uri=None, user=None, password=None):
-        uri = uri or os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        user = user or os.getenv("NEO4J_USER", "neo4j")
+        uri      = uri      or os.getenv("NEO4J_URI",      "bolt://localhost:7687")
+        user     = user     or os.getenv("NEO4J_USER",     "neo4j")
         password = password or os.getenv("NEO4J_PASSWORD", "password")
-
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
 
     def close(self):
         self.driver.close()
 
+    def has_repo(self, repo_name: str) -> bool:
+        with self.driver.session() as session:
+            r = session.run(
+                "MATCH (c:Chunk {repo: $repo}) RETURN count(c) AS n",
+                repo=repo_name
+            ).single()
+            return bool(r and r["n"] > 0)
+
     def clear_repo(self, repo_name: str):
-        """Delete all data for a repository."""
         with self.driver.session() as session:
-            session.run("""
-                MATCH (f:File {repo: $repo})
-                DETACH DELETE f
-            """, repo=repo_name)
+            session.run(
+                "MATCH (f:File {repo: $repo}) DETACH DELETE f",
+                repo=repo_name
+            )
+            session.run(
+                "MATCH (c:Chunk {repo: $repo}) DETACH DELETE c",
+                repo=repo_name
+            )
 
-            session.run("""
-                MATCH (c:Chunk {repo: $repo})
-                DETACH DELETE c
-            """, repo=repo_name)
-
-    def store_chunks(self, chunks: List[Chunk], repo_name: str):
-        """Store chunks with accurate relationship resolution."""
+    def store_chunks(self, chunks: List[Chunk], repo_name: str,
+                     go_package_map: Optional[GoPackageMap] = None):
         with self.driver.session() as session:
-            # 1. Create File nodes
+
+            # ── 1. File nodes ─────────────────────────────────────────
             files = {}
-            for chunk in chunks:
-                if chunk.file not in files:
-                    files[chunk.file] = []
-                files[chunk.file].append(chunk)
+            for c in chunks:
+                files.setdefault(c.file, []).append(c)
 
-            print(f"  📁 Creating {len(files)} file nodes...")
-            for file_path, file_chunks in files.items():
-                result = session.run("""
-                    MERGE (f:File {path: $path, repo: $repo})
-                    SET f.language = $language,
-                        f.chunk_count = $count
-                    RETURN f
-                """, path=file_path, repo=repo_name,
-                     language=file_chunks[0].language, count=len(file_chunks))
-                result.consume()  # Ensure query completes
+            file_rows = [
+                {"path": fp, "lang": fc[0].language, "cnt": len(fc)}
+                for fp, fc in files.items()
+            ]
+            for i in range(0, len(file_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    MERGE (f:File {path: r.path, repo: $repo})
+                    SET f.language = r.lang, f.chunk_count = r.cnt
+                """, rows=file_rows[i:i+BATCH], repo=repo_name)
 
-            # 2. Create Chunk nodes with code stored
-            print(f"  🧩 Creating {len(chunks)} chunk nodes...")
-            for chunk in chunks:
-                # Store code in chunk node for graph traversal
-                result = session.run("""
-                    CREATE (c:Chunk {
-                        id: $id,
-                        repo: $repo,
-                        name: $name,
-                        type: $type,
-                        file: $file,
-                        start: $start,
-                        end: $end,
-                        language: $language,
-                        signature: $signature,
-                        docstring: $docstring,
-                        is_test: $is_test,
-                        code: $code
-                    })
-                    RETURN c
-                """, id=chunk.id, repo=repo_name, name=chunk.name, type=chunk.type,
-                     file=chunk.file, start=chunk.start, end=chunk.end,
-                     language=chunk.language, signature=chunk.signature or "",
-                     docstring=chunk.docstring or "", is_test=chunk.is_test,
-                     code=chunk.code[:5000])  # Limit code size
-                result.consume()
+            # ── 2. Chunk nodes ────────────────────────────────────────
+            print(f"  🧩 {len(chunks)} chunk nodes...")
+            chunk_rows = [{
+                "id":           c.id,
+                "repo":         repo_name,
+                "name":         c.name,
+                "type":         c.type,
+                "file":         c.file,
+                "start":        c.start,
+                "end":          c.end,
+                "language":     c.language,
+                "signature":    c.signature or "",
+                "docstring":    (c.docstring or "")[:500],
+                "is_test":      c.is_test,
+                "code":         c.code[:5000],
+                "package_name": getattr(c, "package_name", ""),
+                "is_entry_point":    getattr(c, "is_entry_point",    False),
+                "entry_point_type":  getattr(c, "entry_point_type",  "") or "",
+                "entry_point_route": getattr(c, "entry_point_route", "") or "",
+                "entry_point_method":getattr(c, "entry_point_method","") or "",
+                "implements":        getattr(c, "implements",        []),
+                "receiver_type":     getattr(c, "receiver_type",     "") or "",
+            } for c in chunks]
 
-            # 3. Create CONTAINS relationships
-            print(f"  🔗 Creating CONTAINS relationships...")
-            contains_count = 0
-            for chunk in chunks:
-                result = session.run("""
-                    MATCH (f:File {path: $file, repo: $repo})
-                    MATCH (c:Chunk {id: $chunk_id, repo: $repo})
+            for i in range(0, len(chunk_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    CREATE (c:Chunk) SET c = r
+                """, rows=chunk_rows[i:i+BATCH])
+
+            # ── 3. CONTAINS ───────────────────────────────────────────
+            contains_rows = [{"file": c.file, "cid": c.id} for c in chunks]
+            for i in range(0, len(contains_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    MATCH (f:File  {path: r.file, repo: $repo})
+                    MATCH (c:Chunk {id:   r.cid,  repo: $repo})
                     MERGE (f)-[:CONTAINS]->(c)
-                    RETURN f, c
-                """, file=chunk.file, repo=repo_name, chunk_id=chunk.id)
-                if result.single():
-                    contains_count += 1
-            print(f"  ✓ Created {contains_count} CONTAINS relationships")
+                """, rows=contains_rows[i:i+BATCH], repo=repo_name)
 
-            # 4. Create HAS_MEMBER relationships (parent-child)
-            for chunk in chunks:
-                if chunk.parent:
-                    session.run("""
-                        MATCH (parent:Chunk {id: $parent_id, repo: $repo})
-                        MATCH (child:Chunk {id: $child_id, repo: $repo})
-                        MERGE (parent)-[:HAS_MEMBER]->(child)
-                    """, parent_id=chunk.parent, child_id=chunk.id, repo=repo_name)
+            # ── 4. HAS_MEMBER ─────────────────────────────────────────
+            member_rows = [
+                {"pid": c.parent, "cid": c.id}
+                for c in chunks if c.parent
+            ]
+            for i in range(0, len(member_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    MATCH (p:Chunk {id: r.pid, repo: $repo})
+                    MATCH (c:Chunk {id: r.cid, repo: $repo})
+                    MERGE (p)-[:HAS_MEMBER]->(c)
+                """, rows=member_rows[i:i+BATCH], repo=repo_name)
 
-            # 5. Create CALLS relationships with accurate resolution
-            print(f"  🔗 Resolving {sum(len(c.calls_with_context) for c in chunks)} calls...")
-            resolved_count = 0
+            # ── 5. CALLS ──────────────────────────────────────────────
+            print("  📞 Resolving CALLS...")
+
+            by_file_name = {}
+            for c in chunks:
+                by_file_name.setdefault((c.file, c.name), []).append(c)
+
+            known_files = set(c.file for c in chunks)
+            call_rows   = []
+
+            go_file_pkg = {}
+            if go_package_map:
+                for pkg, pkg_chunks in go_package_map.package_map.items():
+                    for c in pkg_chunks:
+                        go_file_pkg[c.file] = pkg
+
             for chunk in chunks:
                 for call_info in chunk.calls_with_context:
-                    target = self._resolve_call(call_info, chunk, chunks)
+
+                    if chunk.language == "go" and go_package_map:
+
+                        receiver      = call_info.get("receiver")
+                        receiver_type = call_info.get("receiver_type")
+                        resolved      = call_info.get("resolved", False)
+
+                        # Skip calls that have a receiver variable but no
+                        # resolved type — we don't know what object this is,
+                        # so any match would be a guess.
+                        # Direct calls (receiver=None) are always attempted
+                        # because same-package resolution handles them safely.
+                        if receiver and not resolved:
+                            continue
+
+                        caller_pkg = go_file_pkg.get(chunk.file, "")
+                        target = go_package_map.resolve_call(
+                            call_name      = call_info["name"],
+                            receiver       = receiver,
+                            receiver_type  = receiver_type,
+                            caller_file    = chunk.file,
+                            caller_package = caller_pkg,
+                            resolved       = resolved,
+                        )
+
+                    else:
+                        target = self._resolve_call(
+                            call_info, chunk, by_file_name, known_files
+                        )
+
                     if target:
-                        session.run("""
-                            MATCH (caller:Chunk {id: $caller_id, repo: $repo})
-                            MATCH (callee:Chunk {id: $callee_id, repo: $repo})
-                            MERGE (caller)-[:CALLS {method: $method}]->(callee)
-                        """, caller_id=chunk.id, callee_id=target.id,
-                             method=call_info["name"], repo=repo_name)
-                        resolved_count += 1
+                        call_rows.append({
+                            "caller": chunk.id,
+                            "callee": target.id,
+                            "method": call_info["name"],
+                        })
 
-            print(f"  ✓ Resolved {resolved_count} calls accurately")
+            print(f"    Resolved {len(call_rows)} calls")
+            for i in range(0, len(call_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    MATCH (caller:Chunk {id: r.caller, repo: $repo})
+                    MATCH (callee:Chunk {id: r.callee, repo: $repo})
+                    MERGE (caller)-[:CALLS {method: r.method}]->(callee)
+                """, rows=call_rows[i:i+BATCH], repo=repo_name)
 
-            # 6. Create IMPORTS relationships
+            # ── 6. IMPORTS ────────────────────────────────────────────
+            import_rows = []
             for chunk in chunks:
-                for imp_name, imp_info in chunk.imports_map.items():
-                    target_file = self._resolve_import_path(
-                        imp_info["from"], chunk.file, chunk.language
-                    )
-                    if target_file:
-                        # Find chunks in target file
-                        targets = [c for c in chunks if c.file == target_file and c.name == imp_name]
-                        for target in targets:
-                            session.run("""
-                                MATCH (importer:Chunk {id: $importer_id, repo: $repo})
-                                MATCH (imported:Chunk {id: $imported_id, repo: $repo})
-                                MERGE (importer)-[:IMPORTS {from: $from}]->(imported)
-                            """, importer_id=chunk.id, imported_id=target.id,
-                                 from_=imp_info["from"], repo=repo_name)
+                if chunk.language == "go" and go_package_map:
+                    for local_name, imp_info in chunk.imports_map.items():
+                        if not go_package_map.is_internal_import(
+                            imp_info["from"]
+                        ):
+                            continue
+                        imp_dir = go_package_map.import_path_to_dir(
+                            imp_info["from"]
+                        )
+                        if not imp_dir:
+                            continue
+                        pkg_name = go_package_map.dir_package_map.get(imp_dir)
+                        if not pkg_name:
+                            continue
+                        for target in go_package_map.package_map.get(
+                            pkg_name, []
+                        ):
+                            if target.type in ("struct", "interface",
+                                               "function"):
+                                import_rows.append({
+                                    "importer": chunk.id,
+                                    "imported": target.id,
+                                    "from":     imp_info["from"],
+                                })
+                else:
+                    for imp_name, imp_info in chunk.imports_map.items():
+                        base = self._resolve_import_path(
+                            imp_info["from"], chunk.file, chunk.language
+                        )
+                        target_file = self._find_file(
+                            base, chunk.language, known_files
+                        )
+                        if target_file:
+                            for t in by_file_name.get(
+                                (target_file, imp_name), []
+                            ):
+                                import_rows.append({
+                                    "importer": chunk.id,
+                                    "imported": t.id,
+                                    "from":     imp_info["from"],
+                                })
 
-            # 7. Create SAME_FILE relationships
-            for file_path, file_chunks in files.items():
-                for i, chunk1 in enumerate(file_chunks):
-                    for chunk2 in file_chunks[i+1:]:
-                        session.run("""
-                            MATCH (c1:Chunk {id: $id1, repo: $repo})
-                            MATCH (c2:Chunk {id: $id2, repo: $repo})
-                            MERGE (c1)-[:SAME_FILE]-(c2)
-                        """, id1=chunk1.id, id2=chunk2.id, repo=repo_name)
+            for i in range(0, len(import_rows), BATCH):
+                session.run("""
+                    UNWIND $rows AS r
+                    MATCH (a:Chunk {id: r.importer, repo: $repo})
+                    MATCH (b:Chunk {id: r.imported, repo: $repo})
+                    MERGE (a)-[:IMPORTS {from: r.from}]->(b)
+                """, rows=import_rows[i:i+BATCH], repo=repo_name)
 
-    def _resolve_call(self, call_info: Dict, caller: Chunk, all_chunks: List[Chunk]) -> Optional[Chunk]:
-        """100% accurate call resolution using imports and types."""
-        call_name = call_info["name"]
-        receiver = call_info.get("receiver")
-        receiver_type = call_info.get("receiver_type")
-
-        # Method call (has receiver and type)
-        if receiver and receiver_type:
-            # Find where receiver_type is imported from
-            if receiver_type in caller.imports_map:
-                import_info = caller.imports_map[receiver_type]
-                source_file = self._resolve_import_path(
-                    import_info["from"], caller.file, caller.language
-                )
-
-                if source_file:
-                    # Find the class in source file
-                    target_classes = [c for c in all_chunks
-                                     if c.file == source_file and c.name == receiver_type and c.type == "class"]
-
-                    if target_classes:
-                        target_class = target_classes[0]
-                        # Find method in class
-                        methods = [c for c in all_chunks
-                                  if c.parent == target_class.id and c.name == call_name and c.type == "method"]
-                        if methods:
-                            return methods[0]
-
-        # Direct function call
-        else:
-            # Check if imported
-            if call_name in caller.imports_map:
-                import_info = caller.imports_map[call_name]
-                source_file = self._resolve_import_path(
-                    import_info["from"], caller.file, caller.language
-                )
-
-                if source_file:
-                    targets = [c for c in all_chunks
-                              if c.file == source_file and c.name == call_name]
-                    if targets:
-                        return targets[0]
-
-            # Check same file
-            same_file = [c for c in all_chunks
-                        if c.file == caller.file and c.name == call_name and c.id != caller.id]
-            if same_file:
-                return same_file[0]
-
-        return None
-
-    def _resolve_import_path(self, import_from: str, current_file: str, language: str) -> Optional[str]:
-        """Convert import statement to file path."""
-        if not import_from:
-            return None
-
-        if language == "python":
-            # "models.User" → "models/User.py"
-            return import_from.replace(".", "/") + ".py"
-
-        elif language in ("javascript", "typescript", "jsx", "tsx"):
-            # "./models/User" → "models/User.js"
-            if import_from.startswith("."):
-                base_dir = "/".join(current_file.split("/")[:-1])
-                import_path = import_from.lstrip("./")
-                full_path = f"{base_dir}/{import_path}" if base_dir else import_path
-                # Normalize path
-                parts = []
-                for part in full_path.split("/"):
-                    if part == "..":
-                        if parts:
-                            parts.pop()
-                    elif part and part != ".":
-                        parts.append(part)
-                normalized = "/".join(parts)
-
-                # Try different extensions
-                for ext in [".js", ".ts", ".jsx", ".tsx", "/index.js", "/index.ts"]:
-                    candidate = normalized + ext
-                    return candidate
-                return normalized + ".js"
-            else:
-                # External module
-                return None
-
-        elif language == "java":
-            # "com.example.models.User" → "com/example/models/User.java"
-            return import_from.replace(".", "/") + ".java"
-
-        elif language == "go":
-            # "github.com/example/models" → look for package name
-            # Simplified: use last part
-            return import_from.split("/")[-1] + ".go"
-
-        return None
+            print("  ✅ Graph stored")
 
     def expand_bfs(self, seed_ids: List[str], repo_name: str,
                    max_tokens: int = 8000) -> List[Dict]:
-        """BFS expansion with token budget."""
-        print(f"  [DEBUG BFS] Starting with {len(seed_ids)} seed IDs")
-        print(f"  [DEBUG BFS] Repo name: {repo_name}")
-        print(f"  [DEBUG BFS] Sample seed ID: {seed_ids[0] if seed_ids else 'None'}")
-
         with self.driver.session() as session:
-            # First, check what chunks exist in Neo4j
-            check_result = session.run("""
-                MATCH (c:Chunk {repo: $repo})
-                RETURN count(c) as total, collect(c.id)[0..5] as sample_ids
-            """, repo=repo_name).single()
-
-            if check_result:
-                print(f"  [DEBUG BFS] Neo4j has {check_result['total']} chunks for this repo")
-                print(f"  [DEBUG BFS] Sample Neo4j IDs: {check_result['sample_ids']}")
-
             visited = set(seed_ids)
-            result = []
-            queue = deque(seed_ids)
-            tokens = 0
-            not_found_count = 0
+            queue   = deque((0, sid) for sid in seed_ids)
+            result  = []
+            tokens  = 0
 
             while queue and tokens < max_tokens:
-                chunk_id = queue.popleft()
+                priority, chunk_id = queue.popleft()
 
-                # Get chunk data
-                chunk_result = session.run("""
+                row = session.run(
+                    "MATCH (c:Chunk {id: $id, repo: $repo}) RETURN c",
+                    id=chunk_id, repo=repo_name
+                ).single()
+                if not row:
+                    continue
+
+                data         = dict(row["c"])
+                chunk_tokens = len(data.get("code", "")) // 4
+                if tokens + chunk_tokens > max_tokens:
+                    continue
+
+                result.append(data)
+                tokens += chunk_tokens
+
+                nbr = session.run("""
                     MATCH (c:Chunk {id: $id, repo: $repo})
-                    RETURN c
+                    OPTIONAL MATCH (c)-[:CALLS]->(callee:Chunk   {repo: $repo})
+                    OPTIONAL MATCH (c)-[:IMPORTS]->(imp:Chunk    {repo: $repo})
+                    OPTIONAL MATCH (c)-[:HAS_MEMBER]->(mem:Chunk {repo: $repo})
+                    OPTIONAL MATCH (c)<-[:HAS_MEMBER]-(par:Chunk {repo: $repo})
+                    RETURN
+                        collect(DISTINCT {id: callee.id, pri: 1}) +
+                        collect(DISTINCT {id: imp.id,    pri: 2}) +
+                        collect(DISTINCT {id: mem.id,    pri: 3}) +
+                        collect(DISTINCT {id: par.id,    pri: 3}) AS neighbours
                 """, id=chunk_id, repo=repo_name).single()
 
-                if chunk_result:
-                    chunk_data = dict(chunk_result["c"])
-                    chunk_tokens = len(chunk_data.get("code", "")) // 4
+                if nbr and nbr["neighbours"]:
+                    for n in nbr["neighbours"]:
+                        if n["id"] and n["id"] not in visited:
+                            visited.add(n["id"])
+                            queue.append((n["pri"], n["id"]))
 
-                    if tokens + chunk_tokens <= max_tokens:
-                        result.append(chunk_data)
-                        tokens += chunk_tokens
-
-                        # Get neighbors
-                        neighbors = session.run("""
-                            MATCH (c:Chunk {id: $id, repo: $repo})
-                            -[:CALLS|IMPORTS|HAS_MEMBER|SAME_FILE]-
-                            (neighbor:Chunk {repo: $repo})
-                            RETURN neighbor.id as id
-                        """, id=chunk_id, repo=repo_name)
-
-                        for record in neighbors:
-                            neighbor_id = record["id"]
-                            if neighbor_id not in visited:
-                                visited.add(neighbor_id)
-                                queue.append(neighbor_id)
-                else:
-                    not_found_count += 1
-                    if not_found_count <= 3:  # Only print first few
-                        print(f"  [DEBUG BFS] Chunk not found in Neo4j: {chunk_id}")
-
-            if not_found_count > 0:
-                print(f"  [DEBUG BFS] Total chunks not found: {not_found_count}/{len(seed_ids)}")
+                if tokens < max_tokens * 0.5:
+                    sibs = session.run("""
+                        MATCH (c:Chunk {id: $id, repo: $repo})
+                              <-[:CONTAINS]-(f:File)
+                              -[:CONTAINS]->(sib:Chunk {repo: $repo})
+                        WHERE sib.id <> $id
+                        RETURN sib.id AS id LIMIT 5
+                    """, id=chunk_id, repo=repo_name)
+                    for rec in sibs:
+                        if rec["id"] not in visited:
+                            visited.add(rec["id"])
+                            queue.append((4, rec["id"]))
 
             return result
 
+    def _resolve_call(self, call_info, caller, by_file_name, known_files):
+        name          = call_info["name"]
+        receiver_type = call_info.get("receiver_type")
+
+        if receiver_type and receiver_type in caller.imports_map:
+            base = self._resolve_import_path(
+                caller.imports_map[receiver_type]["from"],
+                caller.file, caller.language
+            )
+            src = self._find_file(base, caller.language, known_files)
+            if src:
+                for cls in by_file_name.get((src, receiver_type), []):
+                    for m in by_file_name.get((src, name), []):
+                        if m.parent == cls.id:
+                            return m
+
+        if name in caller.imports_map:
+            base = self._resolve_import_path(
+                caller.imports_map[name]["from"],
+                caller.file, caller.language
+            )
+            src = self._find_file(base, caller.language, known_files)
+            if src:
+                candidates = by_file_name.get((src, name), [])
+                if candidates:
+                    return candidates[0]
+
+        same = [c for c in by_file_name.get((caller.file, name), [])
+                if c.id != caller.id]
+        return same[0] if same else None
+
+    def _resolve_import_path(self, import_from, current_file, language):
+        if not import_from:
+            return None
+        lang = language.lower()
+        if lang == "python":
+            if import_from.startswith("."):
+                dots  = len(import_from) - len(import_from.lstrip("."))
+                rest  = import_from.lstrip(".")
+                parts = current_file.replace("\\", "/").split("/")[:-1]
+                for _ in range(dots - 1):
+                    parts = parts[:-1] if parts else []
+                if rest:
+                    parts += rest.split(".")
+                return "/".join(parts) if parts else None
+            return import_from.replace(".", "/")
+        elif lang in ("javascript", "typescript", "js", "ts", "jsx", "tsx"):
+            if not import_from.startswith("."):
+                return None
+            base_dir = "/".join(
+                current_file.replace("\\", "/").split("/")[:-1]
+            )
+            raw   = f"{base_dir}/{import_from}" if base_dir else import_from
+            parts = []
+            for seg in raw.replace("\\", "/").split("/"):
+                if seg == "..":
+                    if parts: parts.pop()
+                elif seg and seg != ".":
+                    parts.append(seg)
+            return "/".join(parts) if parts else None
+        elif lang == "java":
+            if import_from.endswith(".*"):
+                return None
+            if any(import_from.startswith(p) for p in EXTERNAL_JAVA):
+                return None
+            return import_from.replace(".", "/")
+        return None
+
+    def _find_file(self, base_path, language, known_files):
+        if not base_path:
+            return None
+        lang     = language.lower()
+        lang_key = {
+            "js": "javascript", "jsx": "javascript",
+            "ts": "typescript", "tsx": "typescript",
+        }.get(lang, lang)
+        for ext in EXTENSION_CANDIDATES.get(lang_key, [".py"]):
+            candidate = (base_path + ext).lstrip("/")
+            if candidate in known_files:
+                return candidate
+        return None
+
     def get_stats(self, repo_name: str) -> Dict:
-        """Get graph statistics."""
         with self.driver.session() as session:
             stats = {}
-
-            result = session.run("""
-                MATCH (c:Chunk {repo: $repo})
-                RETURN count(c) as chunks
-            """, repo=repo_name).single()
-            stats["chunks"] = result["chunks"] if result else 0
-
-            # CONTAINS: File -> Chunk
-            result = session.run("""
-                MATCH (f:File {repo: $repo})-[r:CONTAINS]->(c:Chunk {repo: $repo})
-                RETURN count(r) as count
-            """, repo=repo_name).single()
-            stats["CONTAINS"] = result["count"] if result else 0
-
-            # HAS_MEMBER, CALLS, IMPORTS: Chunk -> Chunk
-            for rel_type in ["HAS_MEMBER", "CALLS", "IMPORTS"]:
-                result = session.run(f"""
-                    MATCH (c1:Chunk {{repo: $repo}})-[r:{rel_type}]->(c2:Chunk {{repo: $repo}})
-                    RETURN count(r) as count
+            r = session.run(
+                "MATCH (c:Chunk {repo:$repo}) RETURN count(c) AS n",
+                repo=repo_name
+            ).single()
+            stats["chunks"] = r["n"] if r else 0
+            for rel in ["CONTAINS", "HAS_MEMBER", "CALLS", "IMPORTS"]:
+                r = session.run(f"""
+                    MATCH (a {{repo:$repo}})-[r:{rel}]->(b {{repo:$repo}})
+                    RETURN count(r) AS n
                 """, repo=repo_name).single()
-                stats[rel_type] = result["count"] if result else 0
-
-            # SAME_FILE: bidirectional
-            result = session.run("""
-                MATCH (c1:Chunk {repo: $repo})-[r:SAME_FILE]-(c2:Chunk {repo: $repo})
-                RETURN count(r) as count
-            """, repo=repo_name).single()
-            stats["SAME_FILE"] = (result["count"] // 2) if result else 0  # Divide by 2 for bidirectional
-
+                stats[rel] = r["n"] if r else 0
+            stats["SAME_FILE"] = 0
             return stats

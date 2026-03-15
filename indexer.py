@@ -1,181 +1,223 @@
-"""Simplified indexer with accurate resolution."""
 import os
 import subprocess
-from typing import List
+from typing import List, Dict, Optional
 from chunk import Chunk
-from config import EMBEDDING_MODEL
 from graph import Graph
 from vectordb import VectorDB
-from parsers import parse_python, parse_javascript, parse_java, parse_go
+from parsers import parse_python, parse_javascript, parse_java
+from parsers.parse_go import parse_go
+from parsers.go_resolver import (
+    parse_go_mod, extract_package_name, GoPackageMap
+)
+from summariser import (
+    generate_situating_contexts,
+    generate_file_summaries,
+    generate_flow_summaries,
+    generate_package_summaries,
+    generate_codebase_summary,
+)
 
 
 def clone_repo(github_url: str, target_dir: str):
-    """Clone a GitHub repository."""
     if os.path.exists(target_dir):
         subprocess.run(['rm', '-rf', target_dir])
-
     print(f"  Cloning {github_url}...")
     subprocess.run(['git', 'clone', github_url, target_dir],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def parse_all_files(repo_path: str) -> List[Chunk]:
-    """Parse all supported files in repository."""
-    chunks = []
-    supported_extensions = {
-        '.py': parse_python,
-        '.js': parse_javascript,
-        '.ts': parse_javascript,
-        '.jsx': parse_javascript,
-        '.tsx': parse_javascript,
+def parse_all_files(repo_path: str,
+                    module_name: Optional[str] = None):
+    chunks:           List[Chunk]    = []
+    file_package_map: Dict[str, str] = {}
+
+    supported = {
+        '.py':   parse_python,
+        '.js':   parse_javascript,
+        '.ts':   parse_javascript,
+        '.jsx':  parse_javascript,
+        '.tsx':  parse_javascript,
         '.java': parse_java,
-        '.go': parse_go
     }
 
     file_count = 0
     for root, dirs, files in os.walk(repo_path):
-        # Skip common ignore directories
         dirs[:] = [d for d in dirs if d not in {
             'node_modules', '.git', '__pycache__', 'venv', 'env',
-            'build', 'dist', 'target', '.next', 'vendor'
+            'build', 'dist', 'target', '.next', 'vendor',
         }]
 
         for file in files:
-            ext = os.path.splitext(file)[1]
-            if ext in supported_extensions:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, repo_path)
+            ext       = os.path.splitext(file)[1]
+            file_path = os.path.join(root, file)
+            rel_path  = os.path.relpath(file_path, repo_path)
 
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception as e:
+                print(f"  Error reading {rel_path}: {e}")
+                continue
 
-                    parser = supported_extensions[ext]
-                    language = ext.lstrip('.')
-                    file_chunks = parser(content, rel_path)
+            try:
+                if ext == '.go':
+                    pkg_name = extract_package_name(content) or ""
+                    file_package_map[rel_path] = pkg_name
+                    file_chunks = parse_go(content, rel_path,
+                                           package_name=pkg_name)
+                elif ext in supported:
+                    file_chunks = supported[ext](content, rel_path)
+                else:
+                    continue
 
-                    # Mark test files
-                    is_test = is_test_file(rel_path)
-                    for chunk in file_chunks:
-                        chunk.is_test = is_test or is_test_chunk(chunk)
+                is_test = is_test_file(rel_path)
+                for chunk in file_chunks:
+                    chunk.is_test = is_test or is_test_chunk(chunk)
 
-                    chunks.extend(file_chunks)
-                    file_count += 1
+                chunks.extend(file_chunks)
+                file_count += 1
 
-                except Exception as e:
-                    print(f"  Error parsing {rel_path}: {e}")
+            except Exception as e:
+                print(f"  Error parsing {rel_path}: {e}")
 
     print(f"  ✓ Parsed {file_count} files → {len(chunks)} chunks")
-    return chunks
+    return chunks, file_package_map
 
 
 def is_test_file(file_path: str) -> bool:
-    """Check if file is a test file."""
-    test_indicators = [
-        '/test/', '/tests/', '/__tests__/', '/spec/', '/specs/',
-        '_test.', '.test.', '.spec.', 'test_', '_spec.'
-    ]
-    return any(indicator in file_path.lower() for indicator in test_indicators)
+    indicators = ['/test/', '/tests/', '/__tests__/', '/spec/',
+                  '_test.', '.test.', '.spec.', 'test_', '_spec.']
+    return any(i in file_path.lower() for i in indicators)
 
 
 def is_test_chunk(chunk: Chunk) -> bool:
-    """Check if chunk is a test function/method."""
     if chunk.name.startswith('test_') or chunk.name.startswith('Test'):
         return True
+    return any(d in chunk.decorators
+               for d in ['@Test', '@test', '@pytest', '@unittest'])
 
-    test_decorators = ['@Test', '@test', '@pytest', '@unittest', '@it', '@describe']
-    return any(dec in chunk.decorators for dec in test_decorators)
 
+def index_repository(repo_identifier: str,
+                      force_reindex: bool = False,
+                      embedding_provider: str = "huggingface",
+                      **embedding_kwargs) -> str:
 
-def index_repository(repo_identifier, force_reindex=False,
-                     embedding_provider="huggingface", **embedding_kwargs):
-    vector_db = VectorDB(embedding_provider=embedding_provider, **embedding_kwargs)
-
-    # Determine if it's a GitHub URL or local path
+    # Resolve repo name and path
     if repo_identifier.startswith('http'):
-        # GitHub URL
-        repo_name = repo_identifier.rstrip('/').split('/')[-2] + '__' + repo_identifier.rstrip('/').split('/')[-1]
-        # IMPORTANT: Lowercase for consistency with vector DB
-        repo_name = repo_name.lower()
+        parts     = repo_identifier.rstrip('/').split('/')
+        repo_name = f"{parts[-2]}__{parts[-1]}".lower()
         repo_path = f"./repos/{repo_name}"
-        clone_repo(repo_identifier, repo_path)
     else:
-        # Local path
         repo_path = repo_identifier
         repo_name = os.path.basename(repo_path.rstrip('/')).lower()
 
-    print(f"\n{'='*60}")
-    print(f"📦 Indexing: {repo_name}")
-    print(f"{'='*60}")
+    # Early exit if already indexed
+    if not force_reindex:
+        vector_db = VectorDB(embedding_provider=embedding_provider,
+                             **embedding_kwargs)
+        graph = Graph()
+        if vector_db.has_repo(repo_name) and graph.has_repo(repo_name):
+            print(f"✅ '{repo_name}' already indexed.")
+            graph.close()
+            return repo_name
+        graph.close()
 
-    # Initialize connections
-    graph = Graph()
+    # Clone if needed
+    if repo_identifier.startswith('http') and not os.path.exists(repo_path):
+        clone_repo(repo_identifier, repo_path)
 
-    # Clear existing data if force reindex
-    if force_reindex:
-        print("🗑️  Force re-index: Deleting existing data...")
-        graph.clear_repo(repo_name)
-        vector_db.delete_repo(repo_name)
-        print("  ✓ Deleted existing data")
+    print(f"\n{'='*60}\n📦 Indexing: {repo_name}\n{'='*60}")
+
+    # Go: parse go.mod
+    module_name = parse_go_mod(repo_path)
 
     # Parse all files
     print("📖 Parsing code...")
-    chunks = parse_all_files(repo_path)
-
+    chunks, file_package_map = parse_all_files(repo_path, module_name)
     if not chunks:
-        print("❌ No chunks extracted!")
-        return
+        print("❌ No chunks extracted.")
+        return repo_name
 
-    # Store in graph with accurate resolution
-    print("🔗 Building graph with accurate resolution...")
-    graph.store_chunks(chunks, repo_name)
+    # Build GoPackageMap
+    go_package_map = None
+    go_chunks = [c for c in chunks if c.language == "go"]
+    if go_chunks:
+        print(f"  🐹 Building Go package map ({len(go_chunks)} chunks)...")
+        go_package_map = GoPackageMap(module_name)
+        go_package_map.build(go_chunks, file_package_map)
 
-    # Get statistics
-    stats = graph.get_stats(repo_name)
-    print(f"\n📊 Graph Statistics:")
-    print(f"  Chunks: {stats['chunks']}")
-    print(f"  Relationships:")
-    for rel_type in ["CONTAINS", "HAS_MEMBER", "CALLS", "IMPORTS", "SAME_FILE"]:
-        print(f"    {rel_type}: {stats[rel_type]}")
+    # Graph and vector DB
+    graph     = Graph()
+    vector_db = VectorDB(embedding_provider=embedding_provider,
+                         **embedding_kwargs)
 
-    # Store in vector DB
-    print("\n🔢 Indexing in vector database...")
-    # Convert chunks to vector DB format
-    vector_data = []
-    for chunk in chunks:
-        vector_data.append({
-            'id': chunk.id,
-            'text': chunk.embedding_text(),
-            'metadata': {
-                'name': chunk.name,
-                'type': chunk.type,
-                'file': chunk.file,
-                'is_test': chunk.is_test
-            }
-        })
-    vector_db.index_batch(repo_name, vector_data)
-    print(f"  ✓ Indexed {len(chunks)} chunks")
+    if force_reindex:
+        print("🗑️  Clearing existing data...")
+        graph.clear_repo(repo_name)
+        vector_db.delete_repo(repo_name)
 
-    # Validation
-    print("\n✅ Indexing complete!")
-    print(f"  Repository: {repo_name}")
-    print(f"  Total chunks: {len(chunks)}")
-    print(f"  Test chunks: {sum(1 for c in chunks if c.is_test)}")
-    print(f"  Relationships: {sum(stats[k] for k in ['CONTAINS', 'HAS_MEMBER', 'CALLS', 'IMPORTS', 'SAME_FILE'])}")
+    # Store graph
+    print("🔗 Building graph...")
+    graph.store_chunks(chunks, repo_name, go_package_map=go_package_map)
 
+    # Initial vector indexing
+    print("\n🔢 Initial embedding...")
+    vector_db.index_batch(repo_name, [{
+        "id":   c.id,
+        "text": c.embedding_text(),
+        "metadata": {
+            "name":             c.name,
+            "type":             c.type,
+            "file":             c.file,
+            "is_test":          c.is_test,
+            "is_entry_point":   c.is_entry_point,
+            "entry_point_type": c.entry_point_type or "",
+        },
+    } for c in chunks])
+
+    # ── Phase 2: chunk situating context ─────────────────────────────
+    generate_situating_contexts(
+        chunks    = chunks,
+        repo_name = repo_name,
+        driver    = graph.driver,
+        vector_db = vector_db,
+        force     = force_reindex,
+    )
+
+    # ── Phase 3: file summaries ───────────────────────────────────────
+    file_summaries = generate_file_summaries(
+        chunks    = chunks,
+        repo_name = repo_name,
+        driver    = graph.driver,
+        vector_db = vector_db,
+    )
+
+    # ── Phase 4: flow detection and summaries ─────────────────────────
+    flow_summaries = generate_flow_summaries(
+        repo_name = repo_name,
+        driver    = graph.driver,
+        vector_db = vector_db,
+    )
+
+    # ── Phase 5: package summaries ────────────────────────────────────
+    pkg_summaries = generate_package_summaries(
+        chunks         = chunks,
+        file_summaries = file_summaries,
+        repo_name      = repo_name,
+        driver         = graph.driver,
+        vector_db      = vector_db,
+    )
+
+    # ── Phase 6: codebase summary ─────────────────────────────────────
+    generate_codebase_summary(
+        chunks         = chunks,
+        pkg_summaries  = pkg_summaries,
+        flow_summaries = flow_summaries,
+        repo_name      = repo_name,
+        driver         = graph.driver,
+        vector_db      = vector_db,
+    )
+
+    print(f"\n✅ Done — {len(chunks)} chunks indexed.")
     graph.close()
-
-
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python simple_indexer.py <github_url_or_path> [--force]")
-        sys.exit(1)
-
-    repo = sys.argv[1]
-    force = '--force' in sys.argv
-
-    index_repository(repo, force)
+    return repo_name

@@ -1,3 +1,3 @@
 ### Codebase RAG
 
-  Intelligence on codebase.
+  Intelligence on codebase.  

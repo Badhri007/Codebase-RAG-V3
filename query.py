@@ -8,16 +8,6 @@ import os
 
 def answer_query(query, repo_name, llm_provider="claude", llm_model=None,
                  embedding_provider="huggingface", **embedding_kwargs):
-
-    """
-    Answer a query about a repository.
-
-    Simple flow:
-    1. Vector search for relevant chunks
-    2. Filter test files (unless requested)
-    3. Graph BFS expansion
-    4. LLM synthesis
-    """
     print(f"\n{'='*60}")
     print(f"❓ Question: {query}")
     print(f"{'='*60}\n")
